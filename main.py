@@ -11,6 +11,15 @@ import logging
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor
 import time
+from supabase import create_client, Client
+import os
+
+# Load Supabase credentials from environment or define directly
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://dsdfw.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-key")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -243,25 +252,26 @@ async def root():
             "/docs": "API documentation"
         }
     }
-
-
 @app.get("/fetch-trailers",
          response_model=TrailerResponse,
          summary="Fetch Movie Trailers",
          description="Dynamically scrape movie trailers from FirstShowing.net based on page numbers")
 async def fetch_trailers(
         page: int = Query(1, ge=1, le=50, description="Single page number to scrape (1-50)"),
-        pages: Optional[str] = Query(None, description="Comma-separated page numbers (e.g., '1,2,3')")
+        pages: Optional[str] = Query(None, description="Comma-separated page numbers (e.g., '1,2,3')"),
+        save_to_db: bool = Query(False, description="If true, save results to Supabase")
 ):
     """
     Fetch movie trailers from FirstShowing.net
 
     - **page**: Single page number (default: 1)
     - **pages**: Multiple pages as comma-separated string (overrides single page)
+    - **save_to_db**: If true, save results to Supabase (default: False)
 
     Examples:
     - `/fetch-trailers?page=1` - Scrape page 1
     - `/fetch-trailers?pages=1,2,3` - Scrape pages 1, 2, and 3
+    - `/fetch-trailers?pages=1,2,3&save_to_db=true` - Scrape pages 1, 2, and 3 and save to Supabase
     """
     start_time = time.time()
 
@@ -283,6 +293,41 @@ async def fetch_trailers(
         # Scrape trailers
         trailers = scraper.scrape_pages(page_list)
 
+        # Save to Supabase if requested
+        # Save to Supabase if requested
+        if save_to_db and trailers:
+            logger.info(f"Preparing to save {len(trailers)} trailers to Supabase...")
+
+            # Step 1: Get all existing youtube_links from DB
+            try:
+                youtube_links = [t.youtube_link for t in trailers]
+                existing_response = supabase.table("trailers").select("youtube_link").in_("youtube_link", youtube_links).execute()
+                existing_links = set(item['youtube_link'] for item in existing_response.data)
+            except Exception as e:
+                logger.error(f"Error checking existing records in Supabase: {e}")
+                existing_links = set()
+
+            # Step 2: Filter only new trailers
+            new_trailers = [t for t in trailers if t.youtube_link not in existing_links]
+
+            if new_trailers:
+                insert_data = [{
+                    "name": t.name,
+                    "youtube_link": t.youtube_link,
+                    "poster_url": t.poster_url,
+                    "source_url": t.source_url,
+                    "is_watched": False
+                } for t in new_trailers]
+
+                try:
+                    supabase.table("trailers").insert(insert_data).execute()
+                    logger.info(f"Inserted {len(insert_data)} new trailers into Supabase.")
+                except Exception as e:
+                    logger.error(f"Error inserting new trailers into Supabase: {e}")
+            else:
+                logger.info("No new trailers to insert.")
+
+
         scrape_time = time.time() - start_time
 
         return TrailerResponse(
@@ -299,8 +344,6 @@ async def fetch_trailers(
     except Exception as e:
         logger.error(f"Error in fetch_trailers: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-
 @app.get("/health",
          summary="Health Check",
          description="Check if the API server is running properly")
